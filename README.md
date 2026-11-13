@@ -1,22 +1,13 @@
 <p align="center">
-  <a href="https://getartcraft.com/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/artcraft-logo-white.svg">
-      <img alt="ArtCraft" src="docs/brand/artcraft-logo.svg" width="200">
-    </picture>
-  </a>
+  <img src="assets/app-icon/hicolor/256x256/apps/ai.storyteller.photocraft.png" width="128" height="128" alt="PhotoForge icon">
 </p>
 
-<p align="center">
-  <img src="assets/app-icon/hicolor/256x256/apps/ai.storyteller.photocraft.png" width="128" height="128" alt="PhotoCraft icon: an engraved nine-tailed fox on a blue tile">
-</p>
-
-<h1 align="center">PhotoCraft</h1>
+<h1 align="center">PhotoForge</h1>
 
 <p align="center">
-  <b>Image editing; an open-source, clean-room reimplementation of Adobe Photoshop, rebuilt in pure Rust.</b><br>
+  <b>AI-assisted photo editing with ComfyUI and External MCP, based on PhotoCraft by the ArtCraft team.</b><br>
   Layers, masks, adjustment layers, layer styles, type, vectors, brushes and real PSD files,<br>
-  in a native app written entirely in Rust. Open source, offline, and yours.
+  plus quantitative AI image diagnostics, coordinate-grid previews, and ComfyUI generative layers in pure Rust.
 </p>
 
 <p align="center">
@@ -447,7 +438,7 @@ The Crafting Apps share the same conventions: clean-room and pure Rust, native o
 
 ## License and credits
 
-PhotoCraft is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+PhotoForge is based on PhotoCraft by the ArtCraft team, dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
 Copyright (c) 2026 ArtCraft Team and the PhotoCraft contributors. Required notices are in [NOTICE](NOTICE).
 
 Bundled fonts, icons, images and other assets keep their own open licenses; each one is listed
@@ -455,17 +446,9 @@ with its author, source and license in [ATTRIBUTION.md](ATTRIBUTION.md).
 
 Every artwork shown is in the public domain (Wikimedia Commons, NASA, U.S. National Archives); sources are listed in [`docs/images/SOURCES.md`](docs/images/SOURCES.md).
 
-The ArtCraft name, wordmark and logos in [`docs/brand/`](docs/brand/) are trademarks of the
-ArtCraft Team and are not covered by this license. They may be used only unmodified, and only as
-part of this repository and PhotoCraft, under [`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt).
-Forks and modified versions must remove them.
+The trademarked ArtCraft wordmarks and logos from upstream `docs/brand/` have been removed in this fork.
 
-<sub>Adobe, Photoshop, Illustrator, Premiere Pro, Lightroom, Acrobat, After Effects and InDesign are trademarks or registered trademarks of Adobe Inc. in the United States and/or other countries. PhotoCraft is an independent, open-source project and is not affiliated with, sponsored by or endorsed by Adobe Inc.; these names are used only to describe the workflows it is compatible with.</sub>
-
-<p align="center">
-  <a href="https://getartcraft.com/"><img alt="ArtCraft" src="docs/brand/artcraft-mark.svg" width="28"></a><br>
-  <sub>Made by the <a href="https://getartcraft.com/">ArtCraft</a> team and community.</sub>
-</p>
+<sub>Adobe, Photoshop, Illustrator, Premiere Pro, Lightroom, Acrobat, After Effects and InDesign are trademarks or registered trademarks of Adobe Inc. in the United States and/or other countries. PhotoForge and PhotoCraft are independent, open-source projects and are not affiliated with, sponsored by or endorsed by Adobe Inc.; these names are used only to describe the workflows they are compatible with.</sub>
 
 ## Star history
 

@@ -1009,6 +1009,41 @@ impl PhotocraftMcp {
         self.doc_render_preview(p).await
     }
 
+    #[tool(
+        description = "Analyze a document or sub-region quantitatively: luminance min/max/mean/percentiles, 16-bin histogram, RGB/saturation/temperature biases, shadow/highlight clipping, edge sharpness, dominant colors, and a 3x3 spatial brightness grid."
+    )]
+    async fn doc_analyze(&self, Parameters(p): Parameters<AnalyzeParams>) -> Result<CallToolResult, McpError> {
+        self.doc_analyze_impl(p).await
+    }
+
+    #[tool(
+        description = "Render a coordinate-annotated flattened PNG preview with document-pixel gridlines, top/left coordinate ruler badges, active selection bounding box, and optional highlight box."
+    )]
+    async fn doc_render_annotated(&self, Parameters(p): Parameters<AnnotatedPreviewParams>) -> Result<CallToolResult, McpError> {
+        self.doc_render_annotated_impl(p).await
+    }
+
+    #[tool(
+        description = "Inspect ComfyUI backend reachability, hardware stats, and installed checkpoints (defaults to http://127.0.0.1:8188 or PHOTOCRAFT_COMFY_URL)."
+    )]
+    async fn comfy_status(&self, Parameters(p): Parameters<ComfyStatusParams>) -> Result<CallToolResult, McpError> {
+        to_result(crate::comfy::check_status(p.comfy_url.as_deref()).await)
+    }
+
+    #[tool(
+        description = "Generate an isolated image item with ComfyUI from a text prompt and place it non-destructively into the active document as a layer or Smart Object."
+    )]
+    async fn ai_generate_item(&self, Parameters(p): Parameters<AiGenerateItemParams>) -> Result<CallToolResult, McpError> {
+        self.ai_generate_item_impl(p).await
+    }
+
+    #[tool(
+        description = "Generative fill / inpaint over the active selection (or explicit document bounds) using ComfyUI, crop-and-stitched back as a feathered non-destructive layer."
+    )]
+    async fn ai_generative_fill(&self, Parameters(p): Parameters<AiGenerativeFillParams>) -> Result<CallToolResult, McpError> {
+        self.ai_generative_fill_impl(p).await
+    }
+
     #[tool(description = "Make the document at `index` active.")]
     async fn doc_select(&self, Parameters(p): Parameters<SelectParams>) -> Result<CallToolResult, McpError> {
         match self.headless_op(move |h| h.select(p.index)).await {
@@ -1353,6 +1388,230 @@ impl PhotocraftMcp {
         };
         to_result(r)
     }
+
+    async fn doc_analyze_impl(&self, p: AnalyzeParams) -> Result<CallToolResult, McpError> {
+        if let Some(r) = self.headless_op(move |h| h.analyze(p.index, p.max_side, p.region)).await {
+            return to_result(r);
+        }
+        if self.bridge_client().is_some() {
+            return bridge_only_headless("doc_analyze");
+        }
+        Ok(no_backend())
+    }
+
+    async fn doc_render_annotated_impl(&self, p: AnnotatedPreviewParams) -> Result<CallToolResult, McpError> {
+        let opts = crate::ai_vision::AnnotateOptions {
+            max_side: p.max_side.unwrap_or(1024),
+            grid_step: p.grid_step,
+            show_grid: p.show_grid.unwrap_or(true),
+            show_axes: p.show_axes.unwrap_or(true),
+            show_selection: p.show_selection.unwrap_or(true),
+            highlight_box: p.highlight_box,
+        };
+        let index = p.index;
+        if let Some(r) = self.headless_op(move |h| h.render_annotated(index, &opts)).await {
+            return Ok(match r {
+                Ok((png, meta)) => png_result(&png, serde_json::to_string(&meta).unwrap_or_else(|_| "annotated preview".into())),
+                Err(e) => fail(e),
+            });
+        }
+        if self.bridge_client().is_some() {
+            return bridge_only_headless("doc_render_annotated");
+        }
+        Ok(no_backend())
+    }
+
+    async fn ai_generate_item_impl(&self, p: AiGenerateItemParams) -> Result<CallToolResult, McpError> {
+        if self.headless_session().is_none() {
+            return if self.bridge_client().is_some() { bridge_only_headless("ai_generate_item") } else { Ok(no_backend()) };
+        }
+        if let Some(err) = self.headless_op(move |h| h.inspect(p.index).map(|_| ())).await
+            && let Err(e) = err
+        {
+            return Ok(fail(e));
+        }
+        let req = crate::comfy::GenerateItemRequest {
+            prompt: p.prompt.clone(),
+            negative_prompt: p.negative_prompt.unwrap_or_default(),
+            width: p.width.unwrap_or(512),
+            height: p.height.unwrap_or(512),
+            steps: p.steps.unwrap_or(20),
+            cfg_scale: p.cfg_scale.unwrap_or(7.0),
+            seed: p.seed,
+            checkpoint: p.checkpoint,
+            comfy_url: p.comfy_url,
+            workflow: p.workflow,
+            timeout_ms: p.timeout_ms,
+        };
+        let (png, comfy_meta) = match crate::comfy::generate_item_png(&req).await {
+            Ok(res) => res,
+            Err(e) => return Ok(fail(e)),
+        };
+        let layer_name = p.layer_name.unwrap_or_else(|| format!("AI: {}", p.prompt.chars().take(28).collect::<String>()));
+        let smart_object = p.smart_object.unwrap_or(true);
+        let place_at = p.place_at;
+        let index = p.index;
+        let Some(placed_res) = self.headless_op(move |h| h.place_generated_png(index, &layer_name, png, place_at, smart_object)).await else {
+            return Ok(no_backend());
+        };
+        match placed_res {
+            Ok(placed) => Ok(ok_json(&json!({ "placed": placed, "comfy": comfy_meta }))),
+            Err(e) => Ok(fail(e)),
+        }
+    }
+
+    async fn ai_generative_fill_impl(&self, p: AiGenerativeFillParams) -> Result<CallToolResult, McpError> {
+        if self.headless_session().is_none() {
+            return if self.bridge_client().is_some() { bridge_only_headless("ai_generative_fill") } else { Ok(no_backend()) };
+        }
+        let index = p.index;
+        let bounds = p.bounds;
+        let padding = p.padding.unwrap_or(32);
+        let feather = p.feather.unwrap_or(8);
+        let Some(crop_res) = self.headless_op(move |h| h.prepare_inpaint_crop(index, bounds, padding, feather)).await else {
+            return Ok(no_backend());
+        };
+        let crop = match crop_res {
+            Ok(c) => c,
+            Err(e) => return Ok(fail(e)),
+        };
+        let req = crate::comfy::InpaintRunRequest {
+            prompt: p.prompt.clone(),
+            negative_prompt: p.negative_prompt.unwrap_or_default(),
+            denoise: p.denoise.unwrap_or(0.85),
+            steps: p.steps.unwrap_or(20),
+            cfg_scale: p.cfg_scale.unwrap_or(7.0),
+            seed: p.seed,
+            checkpoint: p.checkpoint,
+            comfy_url: p.comfy_url,
+            workflow: p.workflow,
+            timeout_ms: p.timeout_ms,
+        };
+        let (stitched_png, comfy_meta) = match crate::comfy::run_inpaint_and_stitch(&crop, &req).await {
+            Ok(res) => res,
+            Err(e) => return Ok(fail(e)),
+        };
+        let layer_name = p.layer_name.unwrap_or_else(|| format!("AI Fill: {}", p.prompt.chars().take(24).collect::<String>()));
+        let smart_object = p.smart_object.unwrap_or(false);
+        let rect = crop.rect;
+        let Some(placed_res) = self.headless_op(move |h| h.place_generated_png(index, &layer_name, stitched_png, Some(rect), smart_object)).await
+        else {
+            return Ok(no_backend());
+        };
+        match placed_res {
+            Ok(placed) => Ok(ok_json(&json!({ "placed": placed, "comfy": comfy_meta }))),
+            Err(e) => Ok(fail(e)),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AnalyzeParams {
+    /// Document index in the session (defaults to active document).
+    pub index: Option<usize>,
+    /// Maximum preview edge for sampling telemetry (default 512, clamped 32..=2048).
+    pub max_side: Option<u32>,
+    /// Optional sub-region `[x, y, width, height]` in document pixels.
+    pub region: Option<[i32; 4]>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AnnotatedPreviewParams {
+    /// Document index in the session (defaults to active document).
+    pub index: Option<usize>,
+    /// Maximum rendered image edge in pixels (default 1024, clamped 32..=2048).
+    pub max_side: Option<u32>,
+    /// Grid interval in document pixels (auto-chosen if omitted).
+    pub grid_step: Option<u32>,
+    /// Draw dashed coordinate gridlines (default true).
+    pub show_grid: Option<bool>,
+    /// Draw document-pixel ruler coordinate badges on top and left edges (default true).
+    pub show_axes: Option<bool>,
+    /// Outline the active selection bounding box (default true).
+    pub show_selection: Option<bool>,
+    /// Optional highlight rectangle `[x, y, width, height]` in document pixels.
+    pub highlight_box: Option<[i32; 4]>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ComfyStatusParams {
+    /// ComfyUI base URL override (defaults to PHOTOCRAFT_COMFY_URL or http://127.0.0.1:8188).
+    pub comfy_url: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiGenerateItemParams {
+    /// Target document index (defaults to active document).
+    pub index: Option<usize>,
+    /// Positive text prompt describing the item to generate.
+    pub prompt: String,
+    /// Optional negative prompt.
+    pub negative_prompt: Option<String>,
+    /// Generation width in pixels (default 512).
+    pub width: Option<u32>,
+    /// Generation height in pixels (default 512).
+    pub height: Option<u32>,
+    /// Sampler step count (default 20).
+    pub steps: Option<u32>,
+    /// CFG guidance scale (default 7.0).
+    pub cfg_scale: Option<f64>,
+    /// Optional deterministic RNG seed.
+    pub seed: Option<u64>,
+    /// Checkpoint filename override (auto-selects first installed checkpoint if omitted).
+    pub checkpoint: Option<String>,
+    /// Name for the created layer.
+    pub layer_name: Option<String>,
+    /// Optional placement box `[x, y, width, height]` in document coordinates.
+    pub place_at: Option<[i32; 4]>,
+    /// Place as an embedded Smart Object layer (default true).
+    pub smart_object: Option<bool>,
+    /// ComfyUI base URL override.
+    pub comfy_url: Option<String>,
+    /// Optional custom ComfyUI workflow API JSON supporting `{{PROMPT}}`, `{{NEGATIVE_PROMPT}}`, `{{CHECKPOINT}}`, `{{WIDTH}}`, `{{HEIGHT}}`, `{{STEPS}}`, `{{CFG}}`, `{{SEED}}`.
+    pub workflow: Option<Value>,
+    /// Timeout in milliseconds (default 120000).
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiGenerativeFillParams {
+    /// Target document index (defaults to active document).
+    pub index: Option<usize>,
+    /// Positive text prompt describing the fill/inpaint replacement.
+    pub prompt: String,
+    /// Optional negative prompt.
+    pub negative_prompt: Option<String>,
+    /// Explicit document region `[x, y, width, height]` when no selection is active.
+    pub bounds: Option<[i32; 4]>,
+    /// Context padding in pixels around the target region (default 32).
+    pub padding: Option<u32>,
+    /// Feather radius in pixels on the stitched layer alpha (default 8).
+    pub feather: Option<u32>,
+    /// Inpaint denoising strength in 0.01..=1.0 (default 0.85).
+    pub denoise: Option<f64>,
+    /// Sampler step count (default 20).
+    pub steps: Option<u32>,
+    /// CFG guidance scale (default 7.0).
+    pub cfg_scale: Option<f64>,
+    /// Optional deterministic RNG seed.
+    pub seed: Option<u64>,
+    /// Checkpoint filename override.
+    pub checkpoint: Option<String>,
+    /// Name for the created layer.
+    pub layer_name: Option<String>,
+    /// Place as Smart Object instead of raster layer (default false).
+    pub smart_object: Option<bool>,
+    /// ComfyUI base URL override.
+    pub comfy_url: Option<String>,
+    /// Optional custom ComfyUI workflow API JSON supporting `{{PROMPT}}`, `{{NEGATIVE_PROMPT}}`, `{{CHECKPOINT}}`, `{{IMAGE}}`, `{{MASK}}`, `{{STEPS}}`, `{{CFG}}`, `{{SEED}}`, `{{DENOISE}}`.
+    pub workflow: Option<Value>,
+    /// Timeout in milliseconds (default 120000).
+    pub timeout_ms: Option<u64>,
 }
 
 mod conventions;

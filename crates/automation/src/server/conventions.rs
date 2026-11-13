@@ -9,7 +9,7 @@ use rmcp::service::RequestContext;
 
 const DOCUMENT: &str = "photocraft://document";
 const COMMANDS: &str = "photocraft://commands";
-const INSTRUCTIONS: &str = "PhotoCraft image editor. Start with doc_new/doc_open, discover ids and parameter docs with command_list, edit with command_run or command_batch (one history step per command). Inspect with doc_inspect and render_preview; doc_save writes native .pcraft or exports by extension. File paths are relative to the read/write roots granted at launch. ui_inspect/ui_screenshot and other ui_* tools require bridge mode. Read photocraft://document and photocraft://commands for live JSON state.";
+const INSTRUCTIONS: &str = "PhotoCraft image editor. Start with doc_new/doc_open, discover ids and parameter docs with command_list, edit with command_run or command_batch (one history step per command). Inspect with doc_inspect, doc_analyze, doc_render_annotated, and render_preview; generate or inpaint layers via comfy_status, ai_generate_item, and ai_generative_fill; doc_save writes native .pcraft or exports by extension. File paths are relative to the read/write roots granted at launch. ui_inspect/ui_screenshot and other ui_* tools require bridge mode. Read photocraft://document and photocraft://commands for live JSON state.";
 
 fn annotated(mut tool: Tool) -> Tool {
     let words = tool.name.replace('_', " ");
@@ -17,11 +17,24 @@ fn annotated(mut tool: Tool) -> Tool {
     let title = chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default();
     let read = matches!(
         tool.name.as_ref(),
-        "command_list" | "doc_inspect" | "session_list" | "render_preview" | "doc_render_preview" | "ui_inspect" | "ui_screenshot" | "jobs_list"
+        "command_list"
+            | "doc_inspect"
+            | "doc_analyze"
+            | "doc_render_annotated"
+            | "comfy_status"
+            | "session_list"
+            | "render_preview"
+            | "doc_render_preview"
+            | "ui_inspect"
+            | "ui_screenshot"
+            | "jobs_list"
     );
     // Changes state without discarding anything: the scoped exports refuse to overwrite a file,
     // and switching the active document edits nothing.
-    let additive = matches!(tool.name.as_ref(), "doc_new" | "doc_open" | "doc_place" | "doc_select" | "doc_export_layers" | "doc_export_data_sets");
+    let additive = matches!(
+        tool.name.as_ref(),
+        "doc_new" | "doc_open" | "doc_place" | "doc_select" | "doc_export_layers" | "doc_export_data_sets" | "ai_generate_item" | "ai_generative_fill"
+    );
     let idempotent = read || tool.name == "doc_select";
     tool.title = Some(title.clone());
     tool.annotations = Some(ToolAnnotations::from_raw(Some(title), Some(read), Some(!read && !additive), Some(idempotent), Some(false)));

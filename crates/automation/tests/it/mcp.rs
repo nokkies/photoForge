@@ -87,12 +87,17 @@ async fn lists_expected_tools() {
         "doc_save",
         "doc_export",
         "doc_inspect",
+        "doc_analyze",
         "doc_render_preview",
+        "doc_render_annotated",
         "doc_select",
         "doc_close",
         "command_list",
         "command_run",
         "command_batch",
+        "comfy_status",
+        "ai_generate_item",
+        "ai_generative_fill",
         "ui_inspect",
         "ui_screenshot",
         "ui_pointer",
@@ -1513,15 +1518,20 @@ async fn convention_tool_hints_match_what_each_tool_does() {
     let expected = [
         ("command_list", READ),
         ("doc_inspect", READ),
+        ("doc_analyze", READ),
+        ("comfy_status", READ),
         ("session_list", READ),
         ("render_preview", READ),
         ("doc_render_preview", READ),
+        ("doc_render_annotated", READ),
         ("ui_inspect", READ),
         ("ui_screenshot", READ),
         ("jobs_list", READ),
         ("doc_new", ADDS),
         ("doc_open", ADDS),
         ("doc_place", ADDS),
+        ("ai_generate_item", ADDS),
+        ("ai_generative_fill", ADDS),
         ("doc_export_layers", ADDS),
         ("doc_export_data_sets", ADDS),
         ("doc_select", (false, false, true)),
@@ -1609,5 +1619,175 @@ async fn convention_resources_are_live_json() {
     assert!(client.read_resource(rmcp::model::ReadResourceRequestParams::new("photocraft://missing")).await.is_err());
     let preview = call(&client, "render_preview", json!({"max_side":4})).await;
     assert!(preview.content.iter().any(|c| c.as_image().is_some()));
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ai_vision_and_comfy_mcp_roundtrip() {
+    use tokio::io::AsyncReadExt;
+
+    let mut mock_rgba = vec![0u8; 64 * 64 * 4];
+    for (i, px) in mock_rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        *px = if (i / 64 + i % 64) % 2 == 0 { [220, 90, 40, 255] } else { [40, 170, 210, 255] };
+    }
+    let mock_png = photocraft_codecs::encode(
+        &photocraft_codecs::Image::from_u8(64, 64, photocraft_codecs::ChannelLayout::Rgba, mock_rgba).unwrap(),
+        photocraft_codecs::Format::Png,
+        &Default::default(),
+    )
+    .unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let comfy_url = format!("http://{addr}");
+    let uploads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let uploads_srv = std::sync::Arc::clone(&uploads);
+
+    let srv = tokio::spawn(async move {
+        let mut prompt_seq = 0usize;
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let png = mock_png.clone();
+            let uploads_conn = std::sync::Arc::clone(&uploads_srv);
+            prompt_seq += 1;
+            let pid = format!("mock-prompt-{prompt_seq}");
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let header_end = loop {
+                    let n = match stream.read(&mut tmp).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+                let first_line = head.lines().next().unwrap_or("");
+                let mut parts = first_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let target = parts.next().unwrap_or("");
+                let content_len = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.trim().eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                while buf.len() < header_end + content_len {
+                    let n = match stream.read(&mut tmp).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+
+                let (ctype, body): (&str, Vec<u8>) = if method == "GET" && target.starts_with("/system_stats") {
+                    ("application/json", json!({"system": {"os": "mock"}, "devices": [{"name": "MockGPU"}]}).to_string().into_bytes())
+                } else if method == "GET" && target.starts_with("/object_info/CheckpointLoaderSimple") {
+                    (
+                        "application/json",
+                        json!({"CheckpointLoaderSimple": {"input": {"required": {"ckpt_name": [["mock-sd15.safetensors"]]}}}})
+                            .to_string()
+                            .into_bytes(),
+                    )
+                } else if method == "POST" && target.starts_with("/upload/image") {
+                    uploads_conn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    ("application/json", json!({"name": "uploaded_crop.png", "subfolder": "", "type": "input"}).to_string().into_bytes())
+                } else if method == "POST" && target.starts_with("/prompt") {
+                    ("application/json", json!({"prompt_id": pid}).to_string().into_bytes())
+                } else if method == "GET" && target.starts_with("/history/") {
+                    let id = target.trim_start_matches("/history/");
+                    (
+                        "application/json",
+                        json!({id: {"outputs": {"9": {"images": [{"filename": "out.png", "subfolder": "", "type": "output"}]}}}})
+                            .to_string()
+                            .into_bytes(),
+                    )
+                } else if method == "GET" && target.starts_with("/view") {
+                    ("image/png", png)
+                } else {
+                    ("text/plain", b"not found".to_vec())
+                };
+                let status = if ctype == "text/plain" { "404 Not Found" } else { "200 OK" };
+                let reply_head = format!("HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = stream.write_all(reply_head.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+
+    let client = connect(PhotocraftMcp::headless()).await;
+    json_of(&call(&client, "doc_new", json!({"width": 128, "height": 96, "background": "white", "name": "VisionTest"})).await);
+    json_of(&call(&client, "command_run", json!({"id": "paint.stroke", "params": {"points": [[12, 12, 1.0], [100, 80, 1.0]], "size": 8, "color": "#112244"}})).await);
+
+    let telemetry = json_of(&call(&client, "doc_analyze", json!({"max_side": 128})).await);
+    assert_eq!(telemetry["document"]["width"], 128);
+    assert_eq!(telemetry["document"]["height"], 96);
+    assert_eq!(telemetry["histogram_16_bins"].as_array().unwrap().len(), 16);
+    assert_eq!(telemetry["spatial_grid_3x3"].as_array().unwrap().len(), 9);
+    assert!(telemetry["edge_sharpness"].as_f64().unwrap() > 0.0);
+    assert!(!telemetry["dominant_colors"].as_array().unwrap().is_empty());
+
+    json_of(&call(&client, "command_run", json!({"id": "select.rect", "params": {"x": 16, "y": 12, "width": 48, "height": 32}})).await);
+    let annotated = call(&client, "doc_render_annotated", json!({"max_side": 256, "highlight_box": [8, 8, 24, 24]})).await;
+    assert_ne!(annotated.is_error, Some(true), "{}", text(&annotated));
+    let img = annotated.content.iter().find_map(|c| c.as_image()).expect("annotated PNG");
+    let png_bytes = base64::engine::general_purpose::STANDARD.decode(&img.data).unwrap();
+    let decoded = photocraft_codecs::decode(&png_bytes).unwrap();
+    assert_eq!(decoded.dimensions(), (128, 96));
+    let note_json: Value = serde_json::from_str(&text(&annotated)).unwrap();
+    assert_eq!(note_json["selection_bounds"], json!([16, 12, 48, 32]));
+    assert_eq!(note_json["highlight_box"], json!([8, 8, 24, 24]));
+
+    let status = json_of(&call(&client, "comfy_status", json!({"comfy_url": comfy_url})).await);
+    assert_eq!(status["online"], true);
+    assert_eq!(status["checkpoints"], json!(["mock-sd15.safetensors"]));
+
+    let generated = json_of(
+        &call(
+            &client,
+            "ai_generate_item",
+            json!({
+                "prompt": "red ceramic mug",
+                "width": 64,
+                "height": 64,
+                "place_at": [32, 24, 40, 40],
+                "layer_name": "AI Mug",
+                "comfy_url": comfy_url,
+            }),
+        )
+        .await,
+    );
+    assert_eq!(generated["placed"]["name"], "AI Mug");
+    assert_eq!(generated["placed"]["smartObject"], true);
+
+    let filled = json_of(
+        &call(
+            &client,
+            "ai_generative_fill",
+            json!({
+                "prompt": "blue sky clouds",
+                "padding": 8,
+                "feather": 4,
+                "layer_name": "AI Sky Fill",
+                "comfy_url": comfy_url,
+            }),
+        )
+        .await,
+    );
+    assert_eq!(filled["placed"]["name"], "AI Sky Fill");
+    assert_eq!(filled["placed"]["smartObject"], false);
+    assert_eq!(filled["comfy"]["crop_rect"], json!([8, 4, 64, 48]));
+    assert_eq!(uploads.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let doc = json_of(&call(&client, "doc_inspect", json!({})).await);
+    let layer_names: Vec<&str> = doc["layers"].as_array().unwrap().iter().filter_map(|l| l["name"].as_str()).collect();
+    assert!(layer_names.contains(&"AI Mug"), "{layer_names:?}");
+    assert!(layer_names.contains(&"AI Sky Fill"), "{layer_names:?}");
+
+    srv.abort();
     client.cancel().await.unwrap();
 }

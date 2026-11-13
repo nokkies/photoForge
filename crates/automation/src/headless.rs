@@ -463,6 +463,62 @@ impl Headless {
         Ok(png)
     }
 
+    /// Analyze the flattened document (or sub-region) quantitatively for AI vision/telemetry.
+    pub fn analyze(&self, index: Option<usize>, max_side: Option<u32>, region: Option<[i32; 4]>) -> Result<Value, AutomationError> {
+        let i = self.doc_index(index)?;
+        let doc = &self.session.documents()[i].doc;
+        if !matches!(&self.filesystem, Filesystem::TrustedLocal) {
+            crate::budgets::check_preview(doc.size.width, doc.size.height, max_side.unwrap_or(512))?;
+        }
+        crate::ai_vision::analyze_document(doc, max_side, region)
+    }
+
+    /// Render a coordinate-annotated PNG preview with pixel gridlines, ruler labels, and selection box.
+    pub fn render_annotated(
+        &self,
+        index: Option<usize>,
+        opts: &crate::ai_vision::AnnotateOptions,
+    ) -> Result<(Vec<u8>, crate::ai_vision::AnnotatedPreviewMeta), AutomationError> {
+        let i = self.doc_index(index)?;
+        let doc = &self.session.documents()[i].doc;
+        if !matches!(&self.filesystem, Filesystem::TrustedLocal) {
+            crate::budgets::check_preview(doc.size.width, doc.size.height, opts.max_side)?;
+        }
+        let (png, meta) = crate::ai_vision::render_annotated_png(doc, opts)?;
+        if !matches!(&self.filesystem, Filesystem::TrustedLocal) {
+            crate::budgets::check_png(png.len())?;
+        }
+        Ok((png, meta))
+    }
+
+    /// Extract a padded composite crop and feathered inpaint mask from the document selection or bounds.
+    pub fn prepare_inpaint_crop(
+        &self,
+        index: Option<usize>,
+        bounds: Option<[i32; 4]>,
+        padding: u32,
+        feather: u32,
+    ) -> Result<crate::comfy::InpaintCrop, AutomationError> {
+        let i = self.doc_index(index)?;
+        let doc = &self.session.documents()[i].doc;
+        crate::comfy::prepare_inpaint_crop(doc, bounds, padding, feather)
+    }
+
+    /// Place a ComfyUI-generated PNG as a non-destructive layer on the target document.
+    pub fn place_generated_png(
+        &mut self,
+        index: Option<usize>,
+        layer_name: &str,
+        png_bytes: Vec<u8>,
+        target_rect: Option<[i32; 4]>,
+        smart_object: bool,
+    ) -> Result<Value, AutomationError> {
+        self.on_doc(index, |this| {
+            this.sync_jobs();
+            crate::comfy::place_png_as_layer(&mut this.session, layer_name, png_bytes, target_rect, smart_object)
+        })
+    }
+
     pub fn session_list(&self) -> Value {
         photocraft_engine::inspect::session(&self.session)
     }
